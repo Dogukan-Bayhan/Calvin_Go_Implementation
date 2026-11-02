@@ -1,0 +1,20 @@
+# Yerel kind kümesi: 1 control-plane + 3 worker. NodePort servisleri host
+# portlarına açılır (docker compose yığınıyla çakışmayacak portlar):
+#   Grafana        http://localhost:3300
+#   Prometheus     http://localhost:9300
+#   İstemci API'si http://localhost:2213
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: calvin
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30300
+        hostPort: 3300
+      - containerPort: 30090
+        hostPort: 9300
+      - containerPort: 30213
+        hostPort: 2213
+  - role: worker
+  - role: worker
+  - role: worker

@@ -27,13 +27,21 @@ const (
 	PaxosReplication
 )
 
+func (m ReplicationMode) String() string {
+	if m == PaxosReplication {
+		return "paxos"
+	}
+	return "async"
+}
+
 type Config struct {
 	Replicas   int
 	Partitions int
 	// EpochDuration sequencer batch aralığıdır (makalede 10 ms).
 	EpochDuration time.Duration
 	Replication   ReplicationMode
-	// NetworkDelay, düğümler arası her mesaja eklenen tek yönlü gecikmedir.
+	// NetworkDelay, aynı süreçteki düğümler arası her mesaja eklenen tek
+	// yönlü simüle gecikmedir. Gerçek ağ üzerindeki düğümlere uygulanmaz.
 	NetworkDelay time.Duration
 	// PrefetchDelay, soğuk veriye erişen işlemlerin sequencer'da bekletileceği
 	// tahmini disk gecikmesidir (§4.1). 0 ise prefetch kapalıdır.
@@ -42,13 +50,25 @@ type Config struct {
 	// Varsayılan MemEngine'dir.
 	NewEngine func(replica, partition int) Engine
 	// Partitioner bir anahtarın partition'ını belirler. Varsayılan FNV hash.
+	// Dağıtık modda tüm süreçlerde aynı olmalıdır.
 	Partitioner func(k Key, partitions int) int
 	// CheckpointDir boş değilse checkpoint'ler buraya JSON olarak yazılır.
 	CheckpointDir string
+	// CheckpointKeep, düğüm başına diskte tutulacak checkpoint dosyası
+	// sayısıdır; eskileri silinir. Varsayılan 2.
+	CheckpointKeep int
 	// Observer metrik kancalarıdır. Varsayılan NopObserver.
 	Observer Observer
 	// Logger yapılandırılmış log çıktısıdır. Varsayılan: log yok.
 	Logger *slog.Logger
+
+	// Hosted bu süreçte çalışacak düğümlerdir. Boşsa tüm düğümler bu süreçte
+	// çalışır (tek süreçli simülasyon). Doluysa küme dağıtık moddadır: diğer
+	// düğümlere PeerAddr ile bulunan adresler üzerinden RPC ile ulaşılır ve
+	// süreç Serve ile dinlemelidir.
+	Hosted []NodeID
+	// PeerAddr dağıtık modda bir düğümün "host:port" adresini döner.
+	PeerAddr func(NodeID) string
 }
 
 func (c *Config) setDefaults() error {
@@ -67,6 +87,9 @@ func (c *Config) setDefaults() error {
 	if c.NewEngine == nil {
 		c.NewEngine = func(int, int) Engine { return NewMemEngine() }
 	}
+	if c.CheckpointKeep <= 0 {
+		c.CheckpointKeep = 2
+	}
 	if c.Observer == nil {
 		c.Observer = NopObserver{}
 	}
@@ -79,6 +102,14 @@ func (c *Config) setDefaults() error {
 			h.Write([]byte(k))
 			return int(h.Sum32() % uint32(n))
 		}
+	}
+	for _, id := range c.Hosted {
+		if id.Replica < 0 || id.Replica >= c.Replicas || id.Partition < 0 || id.Partition >= c.Partitions {
+			return fmt.Errorf("calvin: hosted node %v out of range", id)
+		}
+	}
+	if len(c.Hosted) > 0 && c.PeerAddr == nil {
+		return errors.New("calvin: PeerAddr is required when Hosted is set")
 	}
 	return nil
 }
@@ -93,27 +124,38 @@ type node struct {
 	mbox      mailbox
 }
 
+func (n *node) id() NodeID { return NodeID{n.replica, n.partition} }
+
 type pending struct {
-	ch        chan Result
-	remaining atomic.Int32
-	all       bool // true: sonuç son tamamlanmada verilir (checkpoint)
-	once      sync.Once
-	mu        sync.Mutex
-	err       error
+	t        *Txn
+	ch       chan Result
+	expected int
+	all      bool // true: sonuç son tamamlanmada verilir (checkpoint)
+	once     sync.Once
+	mu       sync.Mutex
+	seen     map[NodeID]bool // aynı düğümden gelen tekrar bildirimler yok sayılır
+	err      error
 }
 
 // Cluster, replica x partition düğümlerinden oluşan bir Calvin dağıtımıdır.
+// Tek süreçli modda tüm düğümleri, dağıtık modda yalnızca Config.Hosted
+// düğümlerini barındırır.
 type Cluster struct {
-	cfg   Config
-	log   *slog.Logger
-	reg   *Registry
-	nodes [][]*node
+	cfg         Config
+	log         *slog.Logger
+	reg         *Registry
+	nodes       [][]*node // bu süreçte olmayan düğümler için nil
+	peers       [][]peer  // uzak düğümler için rpcPeer, yereller için nil
+	hosted      []*node
+	distributed bool
 
 	nextClient atomic.Uint64
 	rr         atomic.Uint64
 	pending    sync.Map // clientID -> *pending
 	inflight   sync.WaitGroup
 	cpMu       sync.Mutex
+
+	genesisNanos atomic.Int64 // epoch 0'ın başladığı an (unix ns); 0: başlamadı
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -124,48 +166,89 @@ func NewCluster(cfg Config, reg *Registry) (*Cluster, error) {
 	if err := cfg.setDefaults(); err != nil {
 		return nil, err
 	}
-	c := &Cluster{cfg: cfg, log: cfg.Logger, reg: reg, stop: make(chan struct{})}
+	c := &Cluster{cfg: cfg, log: cfg.Logger, reg: reg, stop: make(chan struct{}),
+		distributed: len(cfg.Hosted) > 0}
+	hosted := make(map[NodeID]bool)
+	for _, id := range cfg.Hosted {
+		hosted[id] = true
+	}
 	c.nodes = make([][]*node, cfg.Replicas)
+	c.peers = make([][]peer, cfg.Replicas)
 	for r := range c.nodes {
 		c.nodes[r] = make([]*node, cfg.Partitions)
+		c.peers[r] = make([]peer, cfg.Partitions)
 		for p := range c.nodes[r] {
-			n := &node{c: c, replica: r, partition: p, store: newStore(cfg.NewEngine(r, p))}
-			n.mbox = mailbox{size: cfg.Partitions, boxes: make(map[uint64]chan remoteRead)}
+			id := NodeID{r, p}
+			if c.distributed && !hosted[id] {
+				c.peers[r][p] = newRPCPeer(c, id, cfg.PeerAddr(id))
+				continue
+			}
+			n := &node{c: c, replica: r, partition: p, store: newStore(cfg.NewEngine(r, p)),
+				mbox: newMailbox(cfg.Partitions)}
 			c.nodes[r][p] = n
+			c.hosted = append(c.hosted, n)
 		}
 	}
-	for _, row := range c.nodes {
-		for _, n := range row {
-			n.seq = newSequencer(n)
-			n.sched = newScheduler(n)
-		}
+	for _, n := range c.hosted {
+		n.seq = newSequencer(n)
+		n.sched = newScheduler(n)
 	}
 	return c, nil
 }
 
-// Load başlangıç verisini tüm replikalara doğrudan yükler. Start'tan önce
-// çağrılmalıdır.
+func (c *Cluster) local(id NodeID) *node { return c.nodes[id.Replica][id.Partition] }
+
+// peer, from düğümünden to düğümüne ulaşmanın yolunu döner.
+func (c *Cluster) peer(from *node, to NodeID) peer {
+	if n := c.local(to); n != nil {
+		return localPeer{to: n, delayed: n != from}
+	}
+	return c.peers[to.Replica][to.Partition]
+}
+
+// Load başlangıç verisini, bu süreçteki ilgili düğümlere doğrudan yükler.
+// Start'tan önce çağrılmalıdır. Dağıtık modda her süreç aynı veriyle
+// çağırabilir; yalnızca kendi düğümlerine düşen anahtarlar yüklenir.
 func (c *Cluster) Load(k Key, v []byte) {
 	p := c.partitionOf(k)
 	for r := range c.nodes {
-		c.nodes[r][p].store.eng.Put(k, v)
+		if n := c.local(NodeID{r, p}); n != nil {
+			n.store.eng.Put(k, v)
+		}
 	}
 }
 
-func (c *Cluster) Start() {
+// Start kümeyi şimdiki anı epoch başlangıcı (genesis) kabul ederek başlatır.
+func (c *Cluster) Start() { c.StartAt(time.Now()) }
+
+// StartAt kümeyi verilen epoch başlangıcıyla başlatır. Dağıtık modda tüm
+// süreçler aynı genesis'i kullanmalıdır (bkz. FetchGenesis); epoch k, genesis +
+// k*EpochDuration anında kesilir. Makineler arası saat farkı kadar gecikme
+// eklenir; doğruluğu etkilemez.
+func (c *Cluster) StartAt(genesis time.Time) {
+	c.genesisNanos.Store(genesis.UnixNano())
 	c.log.Info("cluster started", "replicas", c.cfg.Replicas, "partitions", c.cfg.Partitions,
 		"replication", c.cfg.Replication.String(), "epoch", c.cfg.EpochDuration,
-		"network_delay", c.cfg.NetworkDelay, "prefetch_delay", c.cfg.PrefetchDelay)
-	for _, row := range c.nodes {
-		for _, n := range row {
+		"network_delay", c.cfg.NetworkDelay, "prefetch_delay", c.cfg.PrefetchDelay,
+		"hosted", len(c.hosted), "distributed", c.distributed, "genesis", genesis.UTC())
+	for _, n := range c.hosted {
+		c.wg.Add(1)
+		go n.sched.run()
+		if n.replica == 0 {
 			c.wg.Add(1)
-			go n.sched.run()
-			if n.replica == 0 {
-				c.wg.Add(1)
-				go n.seq.run()
-			}
+			go n.seq.run()
 		}
 	}
+}
+
+func (c *Cluster) genesis() time.Time { return time.Unix(0, c.genesisNanos.Load()) }
+
+// Genesis kümenin epoch başlangıcıdır; küme başlamadıysa sıfır değer.
+func (c *Cluster) Genesis() time.Time {
+	if n := c.genesisNanos.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return time.Time{}
 }
 
 func (c *Cluster) Stop() {
@@ -176,16 +259,21 @@ func (c *Cluster) Stop() {
 	c.wg.Wait()
 }
 
-func (m ReplicationMode) String() string {
-	if m == PaxosReplication {
-		return "paxos"
+// Hosted bu süreçte çalışan düğümlerin kimlikleridir.
+func (c *Cluster) Hosted() []NodeID {
+	ids := make([]NodeID, len(c.hosted))
+	for i, n := range c.hosted {
+		ids[i] = n.id()
 	}
-	return "async"
+	return ids
 }
 
-// Engine bir düğümün depolama motorunu döner (istatistik ve test için).
+// Engine bir düğümün depolama motorunu döner (bu süreçte değilse nil).
 func (c *Cluster) Engine(replica, partition int) Engine {
-	return c.nodes[replica][partition].store.eng
+	if n := c.local(NodeID{replica, partition}); n != nil {
+		return n.store.eng
+	}
+	return nil
 }
 
 func (c *Cluster) partitionOf(k Key) int { return c.cfg.Partitioner(k, c.cfg.Partitions) }
@@ -244,56 +332,75 @@ func (c *Cluster) submit(req Request, dependent bool) (<-chan Result, error) {
 }
 
 func (c *Cluster) enqueue(t *Txn, completions int, all bool) <-chan Result {
+	n := c.hosted[c.rr.Add(1)%uint64(len(c.hosted))]
 	t.ClientID = c.nextClient.Add(1)
 	t.submitted = time.Now()
-	p := &pending{ch: make(chan Result, 1), all: all}
-	p.remaining.Store(int32(completions))
+	t.origin = n.id()
+	p := &pending{t: t, ch: make(chan Result, 1), expected: completions, all: all,
+		seen: make(map[NodeID]bool)}
 	c.pending.Store(t.ClientID, p)
-	c.inflight.Add(completions)
-
-	total := uint64(c.cfg.Replicas * c.cfg.Partitions)
-	i := c.rr.Add(1) % total
-	n := c.nodes[i/uint64(c.cfg.Partitions)][i%uint64(c.cfg.Partitions)]
+	if !c.distributed {
+		// Drain için iş birimi: işleme katılan her düğüm (replika x partition)
+		// işini bitirince bir workDone çağırır. Normal işlemlerde bu, worker
+		// kilitleri bıraktığında; checkpoint işaretçisinde düğüm
+		// checkpoint'i yazdığında olur.
+		c.inflight.Add(c.cfg.Replicas * len(t.parts))
+	}
 	n.seq.submit(t)
 	return p.ch
 }
 
-// complete her replikadan bir kez (checkpoint için her düğümden bir kez)
-// çağrılır.
-func (c *Cluster) complete(t *Txn, res Result) {
-	v, ok := c.pending.Load(t.ClientID)
+func (c *Cluster) workDone() {
+	if !c.distributed {
+		c.inflight.Done()
+	}
+}
+
+// complete, işlemi alan (origin) süreçte çağrılır: her replikanın ilk aktif
+// katılımcısından bir kez (checkpoint için her düğümden bir kez).
+func (c *Cluster) complete(clientID uint64, from NodeID, res Result) {
+	v, ok := c.pending.Load(clientID)
 	if !ok {
 		return
 	}
 	p := v.(*pending)
-	if p.all {
-		if res.Err != nil {
-			p.mu.Lock()
-			p.err = errors.Join(p.err, res.Err)
-			p.mu.Unlock()
-		}
-	} else {
+	p.mu.Lock()
+	if p.seen[from] {
+		p.mu.Unlock()
+		return
+	}
+	p.seen[from] = true
+	if p.all && res.Err != nil {
+		p.err = errors.Join(p.err, res.Err)
+	}
+	last := len(p.seen) == p.expected
+	p.mu.Unlock()
+
+	if !p.all {
 		p.once.Do(func() {
+			t := p.t
 			lat := time.Since(t.submitted)
 			c.cfg.Observer.TxnCompleted(TxnEvent{
-				Seq: t.Seq, Proc: t.Proc, Partitions: len(t.parts), Dependent: t.Dependent,
+				Seq: res.Seq, Proc: t.Proc, Partitions: len(t.parts), Dependent: t.Dependent,
 				Committed: res.Committed, Err: res.Err, Latency: lat,
 			})
-			c.log.Debug("txn completed", "seq", t.Seq, "proc", t.Proc, "partitions", len(t.parts),
+			c.log.Debug("txn completed", "seq", res.Seq, "proc", t.Proc, "partitions", len(t.parts),
 				"committed", res.Committed, "err", res.Err, "latency", lat)
 			p.ch <- res
 		})
 	}
-	if p.remaining.Add(-1) == 0 {
+	if last {
 		if p.all {
 			p.mu.Lock()
 			res.Err, res.Committed = p.err, p.err == nil
 			p.mu.Unlock()
 			p.ch <- res
 		}
-		c.pending.Delete(t.ClientID)
+		c.pending.Delete(clientID)
 	}
-	c.inflight.Done()
+	if p.all {
+		c.workDone()
+	}
 }
 
 // Exec bir işlemi gönderir ve sonucunu bekler.
@@ -330,7 +437,7 @@ func (c *Cluster) ExecDependent(ctx context.Context, proc string, args []byte, m
 	}
 	var last Result
 	for i := 0; i < maxAttempts; i++ {
-		rs, ws, err := entry.recon(reconReader{c}, args)
+		rs, ws, err := entry.recon(reconReader{c, c.hosted[0].replica}, args)
 		if err != nil {
 			return Result{}, err
 		}
@@ -346,11 +453,14 @@ func (c *Cluster) ExecDependent(ctx context.Context, proc string, args []byte, m
 	return last, nil
 }
 
-// reconReader replica 0'dan kilitsiz okur (düşük izolasyon).
-type reconReader struct{ c *Cluster }
+// reconReader bir replikadan kilitsiz okur (düşük izolasyon).
+type reconReader struct {
+	c       *Cluster
+	replica int
+}
 
 func (r reconReader) Read(k Key) ([]byte, bool) {
-	return r.c.nodes[0][r.c.partitionOf(k)].store.get(k, seqMaxRead)
+	return r.c.peer(nil, NodeID{r.replica, r.c.partitionOf(k)}).read(k)
 }
 
 // Checkpoint global sıraya bir sanal tutarlılık noktası işaretçisi ekler ve
@@ -372,19 +482,17 @@ func (c *Cluster) Checkpoint(ctx context.Context) (uint64, error) {
 		c.log.Error("checkpoint failed", "seq", res.Seq, "err", res.Err)
 		return res.Seq, res.Err
 	}
-	epoch := res.Seq >> (partBits + indexBits)
-	for _, row := range c.nodes {
-		for _, n := range row {
-			n.seq.truncateLog(epoch)
-		}
-	}
-	c.log.Info("checkpoint completed", "seq", res.Seq, "epoch", epoch, "duration", time.Since(start))
+	c.log.Info("checkpoint completed", "seq", res.Seq,
+		"epoch", res.Seq>>(partBits+indexBits), "duration", time.Since(start))
 	return res.Seq, nil
 }
 
 // CheckpointData bir düğümün son checkpoint verisini döner.
 func (c *Cluster) CheckpointData(replica, partition int) map[Key][]byte {
-	return c.nodes[replica][partition].store.lastCheckpoint()
+	if n := c.local(NodeID{replica, partition}); n != nil {
+		return n.store.lastCheckpoint()
+	}
+	return nil
 }
 
 func (c *Cluster) writeCheckpoint(replica, partition int, seq uint64, snap map[Key][]byte) error {
@@ -398,28 +506,63 @@ func (c *Cluster) writeCheckpoint(replica, partition int, seq uint64, snap map[K
 	if err != nil {
 		return err
 	}
-	name := fmt.Sprintf("calvin-r%d-p%d-%020d.json", replica, partition, seq)
-	return os.WriteFile(filepath.Join(c.cfg.CheckpointDir, name), data, 0o644)
+	prefix := fmt.Sprintf("calvin-r%d-p%d-", replica, partition)
+	name := fmt.Sprintf("%s%020d.json", prefix, seq)
+	if err := os.WriteFile(filepath.Join(c.cfg.CheckpointDir, name), data, 0o644); err != nil {
+		return err
+	}
+	// Sıra numarası sıfır dolgulu olduğundan Glob'un sözlük sırası
+	// kronolojiktir; en yeni CheckpointKeep dosya dışındakiler silinir.
+	old, err := filepath.Glob(filepath.Join(c.cfg.CheckpointDir, prefix+"*.json"))
+	if err != nil {
+		return err
+	}
+	for _, f := range old[:max(len(old)-c.cfg.CheckpointKeep, 0)] {
+		if err := os.Remove(f); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Drain, gönderilmiş tüm işlemler tüm replikalarda tamamlanana kadar bekler.
+// Drain, gönderilmiş tüm işlemler tüm replikalardaki tüm katılımcı
+// düğümlerde tamamlanana (yazmalar uygulanıp kilitler bırakılana) kadar bekler.
+// İstemciye sonuç ilk aktif katılımcı bitince döner; diğer partition'lar o an
+// hâlâ yazıyor olabilir, bu yüzden tutarlı bir Snapshot için Drain gerekir.
+//
+// Yalnızca tek süreçli modda çalışır; dağıtık modda süreç diğer düğümlerin
+// işini göremez (bkz. client.Client.WaitQuiescent).
 func (c *Cluster) Drain() { c.inflight.Wait() }
 
-// Snapshot bir replikanın tüm partition'larındaki güncel durumu döner.
+// Snapshot bir replikanın bu süreçteki partition'larındaki güncel durumu döner.
 // Tutarlı bir görüntü için Drain'den sonra çağrılmalıdır.
 func (c *Cluster) Snapshot(replica int) map[Key][]byte {
 	out := make(map[Key][]byte)
 	for _, n := range c.nodes[replica] {
-		n.store.scanAll(func(k Key, v []byte) { out[k] = v })
+		if n != nil {
+			n.store.scanAll(func(k Key, v []byte) { out[k] = v })
+		}
 	}
 	return out
 }
 
-// InputLog bir sequencer'ın replike edilmiş girdi logundaki işlem sayısını
-// döner. Deterministik sistemde kurtarma için yalnızca bu log ve son
+func (c *Cluster) hostedSnapshots(f func(*node) map[Key][]byte) []NodeSnapshot {
+	out := make([]NodeSnapshot, 0, len(c.hosted))
+	for _, n := range c.hosted {
+		out = append(out, NodeSnapshot{ID: n.id(), Data: f(n)})
+	}
+	return out
+}
+
+// InputLog bir sequencer'ın replike edilmiş girdi logundaki batch ve işlem
+// sayısını döner. Deterministik sistemde kurtarma için yalnızca bu log ve son
 // checkpoint gerekir.
 func (c *Cluster) InputLog(replica, partition int) (batches, txns int) {
-	s := c.nodes[replica][partition].seq
+	n := c.local(NodeID{replica, partition})
+	if n == nil {
+		return 0, 0
+	}
+	s := n.seq
 	s.logMu.Lock()
 	defer s.logMu.Unlock()
 	for _, b := range s.log {

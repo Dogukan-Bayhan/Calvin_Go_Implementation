@@ -1,0 +1,3 @@
+deploy/logs/
+*.exe
+deploy/k8s/overlay/

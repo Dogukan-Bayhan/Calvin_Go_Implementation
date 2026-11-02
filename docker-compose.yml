@@ -3,6 +3,8 @@ name: calvin
 services:
   calvin-lab:
     build: .
+    image: calvin:dev
+    entrypoint: ["calvin-lab"]
     # Ayarların hepsi flag'dir; çalışırken POST /api/settings ile de değişir.
     command:
       - -replicas=3

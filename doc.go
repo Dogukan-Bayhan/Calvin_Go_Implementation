@@ -27,4 +27,9 @@
 //   - §5   Sanal tutarlılık noktası kullanan Zig-Zag benzeri asenkron
 //     checkpoint: global sıradaki bir işaretçiden önceki işlemler "before",
 //     sonrakiler "after" sürümlerine yazar.
+//
+// Dağıtık mod: Config.Hosted ayarlanırsa süreç yalnızca o düğümleri
+// barındırır; diğerlerine peer arayüzü (peer.go) üzerinden net/rpc ile ulaşır
+// (rpc.go, wire.go). Tek süreçli modda aynı arayüz doğrudan çağrıya döner.
+// İstemci tarafı için calvin/client paketine bakın.
 package calvin

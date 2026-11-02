@@ -1,0 +1,95 @@
+# Her pod tek bir Calvin düğümüdür: calvin-node-i, i = replica*PARTITIONS + partition.
+# Düğümler birbirini headless servis üzerinden DNS ile bulur
+# (calvin-node-i.calvin-node:7000). Durum bellektedir ve çökmeden kurtarma
+# yoktur; bir pod yeniden başlarsa küme up.ps1 ile sıfırdan kurulmalıdır.
+apiVersion: v1
+kind: Service
+metadata:
+  name: calvin-node
+  labels:
+    app: calvin-node
+spec:
+  clusterIP: None
+  # Düğümler, hazır olmadan (birbirlerini beklerken) DNS'te görünmelidir.
+  publishNotReadyAddresses: true
+  selector:
+    app: calvin-node
+  ports:
+    - name: rpc
+      port: 7000
+    - name: metrics
+      port: 2112
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: calvin-node
+  labels:
+    app: calvin-node
+spec:
+  serviceName: calvin-node
+  replicas: 12
+  # Tüm düğümler aynı anda başlar ve birbirini bekler.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: calvin-node
+  template:
+    metadata:
+      labels:
+        app: calvin-node
+    spec:
+      terminationGracePeriodSeconds: 5
+      # Düğümleri worker'lara yay; aynı partition'ın replikaları mümkünse farklı
+      # makinelere düşsün.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: calvin-node
+      containers:
+        - name: node
+          image: calvin:dev
+          imagePullPolicy: IfNotPresent
+          command: ["calvin-node"]
+          args:
+            - -replicas=$(REPLICAS)
+            - -partitions=$(PARTITIONS)
+            - -mode=$(MODE)
+            - -accounts=$(ACCOUNTS)
+            - -records=$(RECORDS)
+            - -customers=$(CUSTOMERS)
+            - -peer-template=calvin-node-%d.calvin-node:7000
+            - -checkpoint-dir=/data/checkpoints
+          envFrom:
+            - configMapRef:
+                name: calvin-topology
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: rpc
+              containerPort: 7000
+            - name: metrics
+              containerPort: 2112
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}

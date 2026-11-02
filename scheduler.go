@@ -1,7 +1,6 @@
 package calvin
 
 import (
-	"sort"
 	"sync/atomic"
 	"time"
 )
@@ -42,16 +41,19 @@ type scheduler struct {
 	batchIn   chan *batch
 	releaseCh chan *txnState
 
-	pending   map[uint64][]*batch
+	pending   map[uint64]map[int]*batch // epoch -> gönderen sequencer -> batch
 	nextEpoch uint64
 	locks     map[Key][]*lockReq
 	inflight  int
 	cp        *cpWait
 
 	// Stats() için başka goroutine'lerden okunan kopyalar.
-	scheduled  atomic.Uint64
-	inflightN  atomic.Int64
-	lockedKeys atomic.Int64
+	scheduled atomic.Uint64
+	// scheduleDelay: son epoch'un liderde kesilmesinden (en geç kesen lider)
+	// bu scheduler'da kilit istenmesine kadar geçen süre (ns).
+	scheduleDelay atomic.Int64
+	inflightN     atomic.Int64
+	lockedKeys    atomic.Int64
 }
 
 func newScheduler(n *node) *scheduler {
@@ -59,7 +61,7 @@ func newScheduler(n *node) *scheduler {
 		n:         n,
 		batchIn:   make(chan *batch, 1024),
 		releaseCh: make(chan *txnState, 1024),
-		pending:   make(map[uint64][]*batch),
+		pending:   make(map[uint64]map[int]*batch),
 		nextEpoch: 1,
 		locks:     make(map[Key][]*lockReq),
 	}
@@ -73,7 +75,13 @@ func (s *scheduler) run() {
 		case <-c.stop:
 			return
 		case b := <-s.batchIn:
-			s.pending[b.epoch] = append(s.pending[b.epoch], b)
+			if b.epoch < s.nextEpoch {
+				continue // tekrar teslim
+			}
+			if s.pending[b.epoch] == nil {
+				s.pending[b.epoch] = make(map[int]*batch)
+			}
+			s.pending[b.epoch][b.from] = b
 			s.drain()
 		case ts := <-s.releaseCh:
 			s.release(ts)
@@ -84,18 +92,23 @@ func (s *scheduler) run() {
 // drain, tüm sequencer'lardan batch'i gelmiş epoch'ları sırayla işler.
 func (s *scheduler) drain() {
 	for {
-		bs := s.pending[s.nextEpoch]
-		if len(bs) < s.n.c.cfg.Partitions {
+		byFrom := s.pending[s.nextEpoch]
+		if len(byFrom) < s.n.c.cfg.Partitions {
 			return
 		}
 		delete(s.pending, s.nextEpoch)
-		sort.Slice(bs, func(i, j int) bool { return bs[i].from < bs[j].from })
-		for _, b := range bs {
+		var lastCut int64
+		for from := 0; from < s.n.c.cfg.Partitions; from++ {
+			b := byFrom[from]
+			lastCut = max(lastCut, b.cutAt)
 			for _, t := range b.txns {
 				s.admit(t)
 			}
 		}
 		s.scheduled.Store(s.nextEpoch)
+		if lastCut > 0 {
+			s.scheduleDelay.Store(time.Now().UnixNano() - lastCut)
+		}
 		s.nextEpoch++
 		s.inflightN.Store(int64(s.inflight))
 		s.lockedKeys.Store(int64(len(s.locks)))
@@ -242,6 +255,12 @@ func (s *scheduler) fireCheckpoint() {
 		})
 		n.c.log.Debug("node checkpoint written", "replica", n.replica, "partition", n.partition,
 			"seq", marker.Seq, "records", len(snap), "duration", d, "err", err)
-		n.c.complete(marker, Result{Seq: marker.Seq, Committed: err == nil, Err: err})
+		if err == nil {
+			// Bu düğüm artık bu checkpoint'ten kurtarılabilir; öncesinin
+			// girdi loguna gerek yok.
+			n.seq.truncateLog(marker.Seq >> (partBits + indexBits))
+		}
+		n.c.peer(n, marker.origin).complete(marker.ClientID, n.id(),
+			Result{Seq: marker.Seq, Committed: err == nil, Err: err})
 	}()
 }

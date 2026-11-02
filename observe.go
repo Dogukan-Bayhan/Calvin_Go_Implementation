@@ -78,26 +78,38 @@ type NodeStats struct {
 	LockedKeys int64
 	// LoggedBatches: girdi logunda tutulan batch sayısı (checkpoint'te kırpılır).
 	LoggedBatches int
+	// SequencerQueue: (yalnızca lider düğümlerde) henüz batch'e girmemiş işlemler.
+	SequencerQueue int64
+	// ScheduleDelay: son epoch'un liderde kesilmesinden bu düğümde kilit
+	// istenmesine kadar geçen süre (replikasyon + ağ + kuyruk gecikmesi).
+	// Farklı makinelerin saatlerinin senkron olduğunu varsayar.
+	ScheduleDelay time.Duration
 }
 
-// Stats tüm düğümlerin anlık durumunu döner.
+// Stats bu süreçteki düğümlerin anlık durumunu döner. SequencedEpoch yalnızca
+// grup lideri aynı süreçteyse doludur.
 func (c *Cluster) Stats() []NodeStats {
 	var out []NodeStats
-	for _, row := range c.nodes {
-		for _, n := range row {
-			n.seq.logMu.Lock()
-			logged := len(n.seq.log)
-			n.seq.logMu.Unlock()
-			out = append(out, NodeStats{
-				Replica:        n.replica,
-				Partition:      n.partition,
-				SequencedEpoch: n.seq.leader().sequenced.Load(),
-				ScheduledEpoch: n.sched.scheduled.Load(),
-				Inflight:       n.sched.inflightN.Load(),
-				LockedKeys:     n.sched.lockedKeys.Load(),
-				LoggedBatches:  logged,
-			})
+	for _, n := range c.hosted {
+		n.seq.logMu.Lock()
+		logged := len(n.seq.log)
+		n.seq.logMu.Unlock()
+		st := NodeStats{
+			Replica:        n.replica,
+			Partition:      n.partition,
+			ScheduledEpoch: n.sched.scheduled.Load(),
+			Inflight:       n.sched.inflightN.Load(),
+			LockedKeys:     n.sched.lockedKeys.Load(),
+			LoggedBatches:  logged,
+			ScheduleDelay:  time.Duration(n.sched.scheduleDelay.Load()),
 		}
+		if l := c.local(NodeID{0, n.partition}); l != nil {
+			st.SequencedEpoch = l.seq.sequenced.Load()
+		}
+		if n.replica == 0 {
+			st.SequencerQueue = int64(len(n.seq.in)) + n.seq.queued.Load()
+		}
+		out = append(out, st)
 	}
 	return out
 }

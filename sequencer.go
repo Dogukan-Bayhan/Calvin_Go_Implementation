@@ -11,6 +11,16 @@ type delayedTxn struct {
 	readyAt time.Time
 }
 
+type submitKey struct {
+	origin   NodeID
+	clientID uint64
+}
+
+// submitDedupWindow, liderin tekrar gelen istemci isteklerini tanımak için
+// hatırladığı son istek sayısıdır. Ağ üzerinden en az bir kez teslimat,
+// aynı isteğin iki kez sıraya girmesine yol açmamalıdır.
+const submitDedupWindow = 1 << 20
+
 // sequencer, §3.1'deki sıralama katmanının bir partition'ıdır. Her
 // replikasyon grubunda replica 0'daki sequencer lider/master'dır: istemci
 // isteklerini toplar, epoch sonunda batch'e çevirir ve replike eder. Diğer
@@ -21,39 +31,35 @@ type sequencer struct {
 	in chan *Txn
 
 	// yalnızca lider goroutine'i kullanır
-	epoch   uint64
-	waiting []delayedTxn
-
-	acceptor *acceptor
-	paxos    *paxosLeader
-
-	sequenced atomic.Uint64 // lider tarafından kapatılan son epoch
-
-	logMu sync.Mutex
-	log   []*batch // replike edilmiş girdi logu (fiziksel REDO logu yok)
+	epoch      uint64
+	waiting    []delayedTxn
+	seen       map[submitKey]struct{}
+	seenOrder  []submitKey
+	acceptor   *acceptor
+	paxos      *paxosLeader
+	sequenced  atomic.Uint64 // lider tarafından kapatılan son epoch
+	queued     atomic.Int64  // liderde batch'lenmeyi bekleyen işlem sayısı
+	logMu      sync.Mutex
+	log        []*batch // replike edilmiş girdi logu (fiziksel REDO logu yok)
+	delivered  map[uint64]struct{}
+	deliveredW uint64 // bu epoch'a kadar (dahil) tüm epoch'lar teslim edildi
 }
 
 func newSequencer(n *node) *sequencer {
-	s := &sequencer{n: n, in: make(chan *Txn, 4096), acceptor: newAcceptor()}
+	s := &sequencer{
+		n: n, in: make(chan *Txn, 4096), acceptor: newAcceptor(),
+		seen: make(map[submitKey]struct{}), delivered: make(map[uint64]struct{}),
+	}
 	if n.replica == 0 && n.c.cfg.Replication == PaxosReplication {
 		s.paxos = &paxosLeader{s: s, b: ballot{N: 1, ID: n.replica}}
 	}
 	return s
 }
 
-func (s *sequencer) leader() *sequencer { return s.n.c.nodes[0][s.n.partition].seq }
-
 // submit bir istemci isteğini kabul eder. Hem asenkron hem Paxos modunda
 // istekler grubun liderine (replica 0) iletilir.
 func (s *sequencer) submit(t *Txn) {
-	c := s.n.c
-	l := s.leader()
-	c.send(s.n.replica != 0, func() {
-		select {
-		case l.in <- t:
-		case <-c.stop:
-		}
-	})
+	s.n.c.peer(s.n, NodeID{0, s.n.partition}).submit(t)
 }
 
 func (s *sequencer) run() {
@@ -68,7 +74,15 @@ func (s *sequencer) run() {
 		case t := <-s.in:
 			s.accept(t)
 		case now := <-ticker.C:
-			s.cutBatch(now)
+			// Epoch numarası tüm liderler için ortak başlangıç anından (genesis)
+			// itibaren duvar saatiyle belirlenir (§3.1: epoch tüm sistemde
+			// senkron artar). Geç başlayan veya duraklayan bir lider kaçırdığı
+			// epoch'lar için boş batch keserek yetişir. Aksi halde liderlerin
+			// epoch'ları kayar ve scheduler'lar en geride kalan lideri bekler.
+			target := uint64(now.Sub(c.genesis()) / c.cfg.EpochDuration)
+			for s.epoch < target {
+				s.cutBatch(now)
+			}
 		}
 	}
 }
@@ -78,9 +92,21 @@ func (s *sequencer) run() {
 // tahmini disk gecikmesi kadar bekletilir. Böylece disk gecikmesi kilitler
 // alınmadan önce, contention footprint dışında yaşanır.
 //
-// Not: Makaledeki deneylerde olduğu gibi her sequencer tüm sistemdeki sıcak
-// kayıtları bilir; burada bu, motorlara doğrudan sorarak simüle edilir.
+// Not: Makaledeki deneylerde olduğu gibi sequencer sıcak kayıtları bilir;
+// burada bu, aynı süreçteki motorlara doğrudan sorarak simüle edilir. Başka
+// süreçlerdeki düğümler için prefetch yapılmaz.
 func (s *sequencer) accept(t *Txn) {
+	key := submitKey{t.origin, t.ClientID}
+	if _, dup := s.seen[key]; dup {
+		return
+	}
+	s.seen[key] = struct{}{}
+	s.seenOrder = append(s.seenOrder, key)
+	if len(s.seenOrder) > submitDedupWindow {
+		delete(s.seen, s.seenOrder[0])
+		s.seenOrder = s.seenOrder[1:]
+	}
+
 	c := s.n.c
 	readyAt := time.Time{}
 	if c.cfg.PrefetchDelay > 0 && t.kind == kindNormal {
@@ -88,7 +114,11 @@ func (s *sequencer) accept(t *Txn) {
 		for _, k := range append(t.ReadSet[:len(t.ReadSet):len(t.ReadSet)], t.WriteSet...) {
 			q := c.partitionOf(k)
 			for r := 0; r < c.cfg.Replicas; r++ {
-				if pf, ok := c.nodes[r][q].store.eng.(Prefetcher); ok && !pf.IsHot(k) {
+				n := c.local(NodeID{r, q})
+				if n == nil {
+					continue
+				}
+				if pf, ok := n.store.eng.(Prefetcher); ok && !pf.IsHot(k) {
 					cold = true
 					pf.Prefetch(k)
 				}
@@ -99,6 +129,7 @@ func (s *sequencer) accept(t *Txn) {
 		}
 	}
 	s.waiting = append(s.waiting, delayedTxn{t: t, readyAt: readyAt})
+	s.queued.Store(int64(len(s.waiting)))
 }
 
 // cutBatch epoch'u kapatır. Boş olsa bile her epoch için bir batch üretilir;
@@ -106,7 +137,7 @@ func (s *sequencer) accept(t *Txn) {
 // gelmesiyle anlar.
 func (s *sequencer) cutBatch(now time.Time) {
 	s.epoch++
-	b := &batch{epoch: s.epoch, from: s.n.partition}
+	b := &batch{epoch: s.epoch, from: s.n.partition, cutAt: now.UnixNano()}
 	rest := s.waiting[:0]
 	for _, d := range s.waiting {
 		if len(b.txns) < maxBatch && !now.Before(d.readyAt) {
@@ -117,6 +148,7 @@ func (s *sequencer) cutBatch(now time.Time) {
 		}
 	}
 	s.waiting = rest
+	s.queued.Store(int64(len(s.waiting)))
 	s.sequenced.Store(b.epoch)
 	s.n.c.cfg.Observer.BatchSequenced(b.from, b.epoch, len(b.txns))
 
@@ -129,16 +161,28 @@ func (s *sequencer) cutBatch(now time.Time) {
 	c := s.n.c
 	s.deliver(b)
 	for r := 1; r < c.cfg.Replicas; r++ {
-		dst := c.nodes[r][s.n.partition].seq
-		c.send(true, func() { dst.deliver(b) })
+		c.peer(s.n, NodeID{r, s.n.partition}).replicate(b)
 	}
 }
 
 // deliver replike edilmiş bir batch'i loglar ve kendi replikasındaki her
-// scheduler'a yalnızca onun katılacağı işlemleri gönderir.
+// scheduler'a yalnızca onun katılacağı işlemleri gönderir. Aynı epoch'un
+// tekrar teslimi yok sayılır.
 func (s *sequencer) deliver(b *batch) {
 	c := s.n.c
 	s.logMu.Lock()
+	if _, dup := s.delivered[b.epoch]; dup || b.epoch <= s.deliveredW {
+		s.logMu.Unlock()
+		return
+	}
+	s.delivered[b.epoch] = struct{}{}
+	for {
+		if _, ok := s.delivered[s.deliveredW+1]; !ok {
+			break
+		}
+		s.deliveredW++
+		delete(s.delivered, s.deliveredW)
+	}
 	s.log = append(s.log, b)
 	s.logMu.Unlock()
 
@@ -149,14 +193,8 @@ func (s *sequencer) deliver(b *batch) {
 		}
 	}
 	for q := 0; q < c.cfg.Partitions; q++ {
-		sched := c.nodes[s.n.replica][q].sched
-		sub := &batch{epoch: b.epoch, from: b.from, txns: subs[q]}
-		c.send(q != s.n.partition, func() {
-			select {
-			case sched.batchIn <- sub:
-			case <-c.stop:
-			}
-		})
+		sub := &batch{epoch: b.epoch, from: b.from, cutAt: b.cutAt, txns: subs[q]}
+		c.peer(s.n, NodeID{s.n.replica, q}).batch(sub)
 	}
 }
 
@@ -166,9 +204,11 @@ func (s *sequencer) deliver(b *batch) {
 func (s *sequencer) truncateLog(beforeEpoch uint64) {
 	s.logMu.Lock()
 	defer s.logMu.Unlock()
-	i := 0
-	for i < len(s.log) && s.log[i].epoch < beforeEpoch {
-		i++
+	kept := s.log[:0]
+	for _, b := range s.log {
+		if b.epoch >= beforeEpoch {
+			kept = append(kept, b)
+		}
 	}
-	s.log = append([]*batch(nil), s.log[i:]...)
+	s.log = append([]*batch(nil), kept...)
 }

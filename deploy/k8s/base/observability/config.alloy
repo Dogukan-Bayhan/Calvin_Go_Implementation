@@ -1,0 +1,68 @@
+// calvin namespace'indeki calvin-node ve calvin-client pod'larının loglarını
+// Kubernetes API'si üzerinden okur ve Loki'ye gönderir.
+
+discovery.kubernetes "pods" {
+  role = "pod"
+
+  namespaces {
+    names = ["calvin"]
+  }
+}
+
+discovery.relabel "calvin" {
+  targets = discovery.kubernetes.pods.targets
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_label_app"]
+    regex         = "calvin-node|calvin-client"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_label_app"]
+    target_label  = "app"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_name"]
+    target_label  = "pod"
+  }
+
+  rule {
+    target_label = "job"
+    replacement  = "calvin"
+  }
+}
+
+loki.source.kubernetes "pods" {
+  targets    = discovery.relabel.calvin.output
+  forward_to = [loki.process.calvin.receiver]
+}
+
+loki.process "calvin" {
+  stage.json {
+    expressions = {
+      level = "level",
+      ts    = "time",
+    }
+  }
+
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339Nano"
+  }
+
+  stage.labels {
+    values = {
+      level = "",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

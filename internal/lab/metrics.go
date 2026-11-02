@@ -1,5 +1,7 @@
 // Package lab, Calvin için uzun süre çalışan bir test ortamıdır: iş yükü
-// üreticisi, canlı doğruluk denetleyicisi ve Prometheus metrikleri.
+// üreticisi, canlı doğruluk denetleyicisi ve Prometheus metrikleri. Hem tek
+// süreçli kümeyle (cmd/calvin-lab) hem RPC ile bağlanılan dağıtık kümeyle
+// (cmd/calvin-client) çalışır.
 package lab
 
 import (
@@ -15,8 +17,9 @@ import (
 // latencyBuckets 0.25 ms ile ~4 s arasını kapsar.
 var latencyBuckets = prometheus.ExponentialBuckets(0.00025, 2, 15)
 
-// Metrics, calvin.Observer'ı Prometheus'a bağlar.
-type Metrics struct {
+// NodeMetrics, calvin.Observer'ı Prometheus'a bağlar; Calvin düğümlerini
+// barındıran süreçte kaydedilir.
+type NodeMetrics struct {
 	txnTotal        *prometheus.CounterVec
 	txnLatency      *prometheus.HistogramVec
 	lockWait        *prometheus.HistogramVec
@@ -28,24 +31,15 @@ type Metrics struct {
 	checkpointDur   prometheus.Histogram
 	checkpointRecs  *prometheus.GaugeVec
 	checkpointTotal *prometheus.CounterVec
-
-	VerifyRuns           *prometheus.CounterVec
-	VerifyPause          prometheus.Histogram
-	ReplicasConsistent   prometheus.Gauge
-	InvariantOK          prometheus.Gauge
-	CheckpointConsistent prometheus.Gauge
-	LastVerify           prometheus.Gauge
-	Clients              prometheus.Gauge
-	SettingsInfo         *prometheus.GaugeVec
 }
 
-func NewMetrics(reg prometheus.Registerer) *Metrics {
-	m := &Metrics{
+func NewNodeMetrics(reg prometheus.Registerer) *NodeMetrics {
+	m := &NodeMetrics{
 		txnTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "calvin_txn_total", Help: "Tamamlanan işlemler, sonuca göre.",
+			Name: "calvin_txn_total", Help: "Tamamlanan işlemler, sonuca göre (isteği alan düğümde sayılır).",
 		}, []string{"proc", "result", "multipartition"}),
 		txnLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name: "calvin_txn_latency_seconds", Help: "Gönderimden ilk replikada tamamlanmaya kadar geçen süre.",
+			Name: "calvin_txn_latency_seconds", Help: "Düğüme gelişten ilk replikada tamamlanmaya kadar geçen süre.",
 			Buckets: latencyBuckets,
 		}, []string{"proc", "multipartition"}),
 		lockWait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -81,7 +75,84 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		checkpointTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "calvin_checkpoints_total", Help: "Düğüm checkpoint'leri, sonuca göre.",
 		}, []string{"result"}),
+	}
+	reg.MustRegister(m.txnTotal, m.txnLatency, m.lockWait, m.remoteReadWait, m.footprint,
+		m.batchTxns, m.paxosRound, m.paxosRounds, m.checkpointDur, m.checkpointRecs, m.checkpointTotal)
+	return m
+}
 
+func role(active bool) string {
+	if active {
+		return "active"
+	}
+	return "passive"
+}
+
+func (m *NodeMetrics) BatchSequenced(_ int, _ uint64, txns int) { m.batchTxns.Observe(float64(txns)) }
+
+func (m *NodeMetrics) PaxosRound(_ int, d time.Duration, ok bool) {
+	m.paxosRound.Observe(d.Seconds())
+	if ok {
+		m.paxosRounds.WithLabelValues("chosen").Inc()
+	} else {
+		m.paxosRounds.WithLabelValues("rejected").Inc()
+	}
+}
+
+func (m *NodeMetrics) TxnReleased(ev calvin.NodeTxnEvent) {
+	r := role(ev.Active)
+	m.lockWait.WithLabelValues(r).Observe(ev.LockWait.Seconds())
+	m.footprint.WithLabelValues(r).Observe(ev.Footprint.Seconds())
+	if ev.Active {
+		m.remoteReadWait.Observe(ev.RemoteReadWait.Seconds())
+	}
+}
+
+func (m *NodeMetrics) TxnCompleted(ev calvin.TxnEvent) {
+	mp := strconv.FormatBool(ev.Partitions > 1)
+	result := "committed"
+	switch {
+	case ev.Committed:
+	case errors.Is(ev.Err, calvin.ErrRestart):
+		result = "restart"
+	case errors.Is(ev.Err, calvin.ErrAborted):
+		result = "aborted"
+	default:
+		result = "error"
+	}
+	m.txnTotal.WithLabelValues(ev.Proc, result, mp).Inc()
+	m.txnLatency.WithLabelValues(ev.Proc, mp).Observe(ev.Latency.Seconds())
+}
+
+func (m *NodeMetrics) CheckpointDone(ev calvin.CheckpointEvent) {
+	m.checkpointDur.Observe(ev.Duration.Seconds())
+	m.checkpointRecs.WithLabelValues(strconv.Itoa(ev.Replica), strconv.Itoa(ev.Partition)).Set(float64(ev.Records))
+	if ev.Err != nil {
+		m.checkpointTotal.WithLabelValues("error").Inc()
+	} else {
+		m.checkpointTotal.WithLabelValues("ok").Inc()
+	}
+}
+
+// LabMetrics yük üreticisi ve doğrulayıcının metrikleridir.
+type LabMetrics struct {
+	ClientLatency        *prometheus.HistogramVec
+	VerifyRuns           *prometheus.CounterVec
+	VerifyPause          prometheus.Histogram
+	ReplicasConsistent   prometheus.Gauge
+	InvariantOK          prometheus.Gauge
+	CheckpointConsistent prometheus.Gauge
+	LastVerify           prometheus.Gauge
+	Clients              prometheus.Gauge
+	SettingsInfo         *prometheus.GaugeVec
+}
+
+func NewLabMetrics(reg prometheus.Registerer) *LabMetrics {
+	m := &LabMetrics{
+		ClientLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "calvin_client_latency_seconds", Help: "İstemcinin gördüğü uçtan uca işlem süresi (ağ dahil).",
+			Buckets: latencyBuckets,
+		}, []string{"workload"}),
 		VerifyRuns: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "calvin_lab_verify_runs_total", Help: "Canlı doğrulama çalıştırmaları.",
 		}, []string{"result"}),
@@ -108,73 +179,18 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "calvin_lab_settings_info", Help: "Aktif iş yükü ayarları.",
 		}, []string{"workload", "multipartition", "contention"}),
 	}
-	reg.MustRegister(m.txnTotal, m.txnLatency, m.lockWait, m.remoteReadWait, m.footprint,
-		m.batchTxns, m.paxosRound, m.paxosRounds, m.checkpointDur, m.checkpointRecs,
-		m.checkpointTotal, m.VerifyRuns, m.VerifyPause, m.ReplicasConsistent, m.InvariantOK,
-		m.CheckpointConsistent, m.LastVerify, m.Clients, m.SettingsInfo)
+	reg.MustRegister(m.ClientLatency, m.VerifyRuns, m.VerifyPause, m.ReplicasConsistent,
+		m.InvariantOK, m.CheckpointConsistent, m.LastVerify, m.Clients, m.SettingsInfo)
 	return m
 }
 
-func role(active bool) string {
-	if active {
-		return "active"
-	}
-	return "passive"
-}
-
-func (m *Metrics) BatchSequenced(_ int, _ uint64, txns int) { m.batchTxns.Observe(float64(txns)) }
-
-func (m *Metrics) PaxosRound(_ int, d time.Duration, ok bool) {
-	m.paxosRound.Observe(d.Seconds())
-	if ok {
-		m.paxosRounds.WithLabelValues("chosen").Inc()
-	} else {
-		m.paxosRounds.WithLabelValues("rejected").Inc()
-	}
-}
-
-func (m *Metrics) TxnReleased(ev calvin.NodeTxnEvent) {
-	r := role(ev.Active)
-	m.lockWait.WithLabelValues(r).Observe(ev.LockWait.Seconds())
-	m.footprint.WithLabelValues(r).Observe(ev.Footprint.Seconds())
-	if ev.Active {
-		m.remoteReadWait.Observe(ev.RemoteReadWait.Seconds())
-	}
-}
-
-func (m *Metrics) TxnCompleted(ev calvin.TxnEvent) {
-	mp := strconv.FormatBool(ev.Partitions > 1)
-	result := "committed"
-	switch {
-	case ev.Committed:
-	case errors.Is(ev.Err, calvin.ErrRestart):
-		result = "restart"
-	case errors.Is(ev.Err, calvin.ErrAborted):
-		result = "aborted"
-	default:
-		result = "error"
-	}
-	m.txnTotal.WithLabelValues(ev.Proc, result, mp).Inc()
-	m.txnLatency.WithLabelValues(ev.Proc, mp).Observe(ev.Latency.Seconds())
-}
-
-func (m *Metrics) CheckpointDone(ev calvin.CheckpointEvent) {
-	m.checkpointDur.Observe(ev.Duration.Seconds())
-	m.checkpointRecs.WithLabelValues(strconv.Itoa(ev.Replica), strconv.Itoa(ev.Partition)).Set(float64(ev.Records))
-	if ev.Err != nil {
-		m.checkpointTotal.WithLabelValues("error").Inc()
-	} else {
-		m.checkpointTotal.WithLabelValues("ok").Inc()
-	}
-}
-
 // StatsCollector, Cluster.Stats() ve disk motoru sayaçlarını her scrape'te
-// okuyup yayınlar.
+// okuyup yayınlar. Dağıtık modda yalnızca bu süreçteki düğümleri kapsar.
 type StatsCollector struct {
 	c     *calvin.Cluster
 	disks [][]*calvin.SimDiskEngine
 
-	seqEpoch, schedEpoch, lag, inflight, locked, logBatches, stalls *prometheus.Desc
+	seqEpoch, schedEpoch, delay, inflight, locked, logBatches, queue, stalls *prometheus.Desc
 }
 
 func NewStatsCollector(c *calvin.Cluster, disks [][]*calvin.SimDiskEngine) *StatsCollector {
@@ -183,10 +199,11 @@ func NewStatsCollector(c *calvin.Cluster, disks [][]*calvin.SimDiskEngine) *Stat
 		c: c, disks: disks,
 		seqEpoch:   prometheus.NewDesc("calvin_sequencer_epoch", "Lider sequencer'ın kapattığı son epoch.", []string{"partition"}, nil),
 		schedEpoch: prometheus.NewDesc("calvin_scheduler_epoch", "Scheduler'ın kilitlerini istediği son epoch.", node, nil),
-		lag:        prometheus.NewDesc("calvin_replica_lag_epochs", "Sequencer epoch'u ile scheduler epoch'u arasındaki fark.", node, nil),
+		delay:      prometheus.NewDesc("calvin_schedule_delay_seconds", "Son epoch'un liderde kesilmesinden bu düğümde kilit istenmesine kadar geçen süre.", node, nil),
 		inflight:   prometheus.NewDesc("calvin_scheduler_inflight", "Kilit kuyruğunda olup bitmemiş işlemler.", node, nil),
 		locked:     prometheus.NewDesc("calvin_locked_keys", "Kilit tablosundaki anahtar sayısı.", node, nil),
 		logBatches: prometheus.NewDesc("calvin_input_log_batches", "Girdi logunda tutulan batch sayısı.", node, nil),
+		queue:      prometheus.NewDesc("calvin_sequencer_queue", "Liderde batch'lenmeyi bekleyen işlemler.", []string{"partition"}, nil),
 		stalls:     prometheus.NewDesc("calvin_disk_stalls_total", "Yürütme sırasında soğuk veriye takılan okumalar.", node, nil),
 	}
 }
@@ -201,10 +218,10 @@ func (s *StatsCollector) Collect(ch chan<- prometheus.Metric) {
 		r, p := strconv.Itoa(st.Replica), strconv.Itoa(st.Partition)
 		if st.Replica == 0 {
 			gauge(s.seqEpoch, float64(st.SequencedEpoch), p)
+			gauge(s.queue, float64(st.SequencerQueue), p)
 		}
-		lag := float64(st.SequencedEpoch) - float64(st.ScheduledEpoch)
 		gauge(s.schedEpoch, float64(st.ScheduledEpoch), r, p)
-		gauge(s.lag, max(lag, 0), r, p)
+		gauge(s.delay, st.ScheduleDelay.Seconds(), r, p)
 		gauge(s.inflight, float64(st.Inflight), r, p)
 		gauge(s.locked, float64(st.LockedKeys), r, p)
 		gauge(s.logBatches, float64(st.LoggedBatches), r, p)

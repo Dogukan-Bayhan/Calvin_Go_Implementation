@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -169,9 +170,10 @@ func TestReadOnlyAndUndeclaredKey(t *testing.T) {
 // görüntüyü kaydetmelidir.
 func TestCheckpointUnderLoad(t *testing.T) {
 	const accounts, balance = 30, 100
+	dir := t.TempDir()
 	c := newBank(t, Config{
 		Replicas: 2, Partitions: 3, EpochDuration: 2 * time.Millisecond,
-		CheckpointDir: t.TempDir(),
+		CheckpointDir: dir,
 	}, accounts, balance)
 
 	var wg sync.WaitGroup
@@ -202,6 +204,17 @@ func TestCheckpointUnderLoad(t *testing.T) {
 	}
 	if total(c.Snapshot(0)) != accounts*balance {
 		t.Fatal("live state inconsistent after checkpoint merge")
+	}
+
+	// Saklama: düğüm başına yalnızca son CheckpointKeep (varsayılan 2) dosya kalır.
+	for i := 0; i < 2; i++ {
+		if _, err := c.Checkpoint(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+	if want := 2 * 3 * 2; len(files) != want {
+		t.Fatalf("%d checkpoint files on disk, want %d", len(files), want)
 	}
 }
 

@@ -15,27 +15,68 @@ type remoteRead struct {
 
 // mailbox, uzak okuma sonuçlarını işlem sırası numarasına göre tamponlar.
 // Karşı düğüm işlemi henüz başlatmamış olsa bile mesajlar burada bekler.
+// Aynı göndericiden gelen tekrarlar ve işi bitmiş işlemlere geç gelen
+// mesajlar yok sayılır.
 type mailbox struct {
-	mu    sync.Mutex
-	size  int
-	boxes map[uint64]chan remoteRead
+	mu      sync.Mutex
+	size    int
+	boxes   map[uint64]*inbox
+	dropped map[uint64]struct{}
+	order   []uint64
+}
+
+type inbox struct {
+	ch   chan remoteRead
+	from map[int]bool
+}
+
+const mailboxDroppedWindow = 1 << 16
+
+func newMailbox(size int) mailbox {
+	return mailbox{size: size, boxes: make(map[uint64]*inbox), dropped: make(map[uint64]struct{})}
+}
+
+func (m *mailbox) boxLocked(seq uint64) *inbox {
+	ib, ok := m.boxes[seq]
+	if !ok {
+		ib = &inbox{ch: make(chan remoteRead, m.size), from: make(map[int]bool)}
+		m.boxes[seq] = ib
+	}
+	return ib
 }
 
 func (m *mailbox) box(seq uint64) chan remoteRead {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	ch, ok := m.boxes[seq]
-	if !ok {
-		ch = make(chan remoteRead, m.size)
-		m.boxes[seq] = ch
+	return m.boxLocked(seq).ch
+}
+
+func (m *mailbox) put(seq uint64, msg remoteRead) {
+	m.mu.Lock()
+	if _, done := m.dropped[seq]; done {
+		m.mu.Unlock()
+		return
 	}
-	return ch
+	ib := m.boxLocked(seq)
+	if ib.from[msg.from] {
+		m.mu.Unlock()
+		return
+	}
+	ib.from[msg.from] = true
+	m.mu.Unlock()
+	ib.ch <- msg // farklı gönderici sayısı <= partition sayısı = kapasite
 }
 
 func (m *mailbox) drop(seq uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.boxes, seq)
+	m.dropped[seq] = struct{}{}
+	m.order = append(m.order, seq)
+	if len(m.order) > mailboxDroppedWindow {
+		delete(m.dropped, m.order[0])
+		m.order = m.order[1:]
+	}
 }
 
 // execute, tüm kilitleri alınmış bir işlemi §3.2'deki beş aşamada yürütür.
@@ -85,14 +126,13 @@ func (n *node) execute(ts *txnState) {
 			if q == n.partition {
 				continue
 			}
-			box := c.nodes[n.replica][q].mbox.box(t.Seq)
-			msg := remoteRead{from: n.partition, values: local}
-			c.send(true, func() { box <- msg })
+			c.peer(n, NodeID{n.replica, q}).remoteRead(t.Seq, remoteRead{from: n.partition, values: local})
 		}
 	}
 	if !isActive {
 		// Pasif katılımcı veri değiştirmez; burada işi biter.
 		n.releaseLocks(ts)
+		c.workDone()
 		return
 	}
 
@@ -132,8 +172,9 @@ func (n *node) execute(ts *txnState) {
 	}
 	n.releaseLocks(ts)
 	if n.partition == active[0] {
-		c.complete(t, res)
+		c.peer(n, t.origin).complete(t.ClientID, n.id(), res)
 	}
+	c.workDone()
 }
 
 func (n *node) releaseLocks(ts *txnState) {

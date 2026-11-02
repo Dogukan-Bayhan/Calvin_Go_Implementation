@@ -46,9 +46,9 @@ func (s Settings) Validate() error {
 
 // Runner yük üreticisi ve canlı doğrulayıcıdır.
 type Runner struct {
-	c     *calvin.Cluster
+	be    Backend
 	log   *slog.Logger
-	m     *Metrics
+	m     *LabMetrics
 	micro *Micro
 	bank  *Bank
 	disks [][]*calvin.SimDiskEngine
@@ -65,11 +65,15 @@ type Runner struct {
 
 	committed, aborted, restarts, errs atomic.Int64
 	latencyNanos                       atomic.Int64
+	// totals: başlangıçtan beri commit, abort, restart, hata (Summary sıfırlamaz).
+	totals [4]atomic.Int64
 }
 
-func NewRunner(c *calvin.Cluster, log *slog.Logger, m *Metrics, micro *Micro, bank *Bank,
+// NewRunner bir yük üreticisi oluşturur. disks yalnızca tek süreçli
+// SimDiskEngine kullanımında doludur (EvictRandom için).
+func NewRunner(be Backend, log *slog.Logger, m *LabMetrics, micro *Micro, bank *Bank,
 	disks [][]*calvin.SimDiskEngine, replicas int) *Runner {
-	return &Runner{c: c, log: log, m: m, micro: micro, bank: bank, disks: disks, reps: replicas}
+	return &Runner{be: be, log: log, m: m, micro: micro, bank: bank, disks: disks, reps: replicas}
 }
 
 func (r *Runner) Settings() Settings { return *r.settings.Load() }
@@ -120,21 +124,27 @@ func (r *Runner) worker(seed int64, stop chan struct{}) {
 		}
 		start := time.Now()
 		r.gate.RLock()
-		res, err := w.Step(ctx, r.c, rng, s)
+		res, err := w.Step(ctx, r.be, rng, s)
 		r.gate.RUnlock()
-		r.latencyNanos.Add(int64(time.Since(start)))
+		lat := time.Since(start)
+		r.latencyNanos.Add(int64(lat))
+		r.m.ClientLatency.WithLabelValues(w.Name()).Observe(lat.Seconds())
 		switch {
 		case errors.Is(err, calvin.ErrStopped):
 			return
 		case err != nil:
 			r.errs.Add(1)
+			r.totals[3].Add(1)
 			r.log.Warn("operation failed", "workload", w.Name(), "err", err)
 		case res.Committed:
 			r.committed.Add(1)
+			r.totals[0].Add(1)
 		case errors.Is(res.Err, calvin.ErrRestart):
 			r.restarts.Add(1)
+			r.totals[2].Add(1)
 		default:
 			r.aborted.Add(1)
+			r.totals[1].Add(1)
 		}
 		if s.ThinkMillis > 0 {
 			select {
@@ -175,21 +185,27 @@ func (r *Runner) Verify() VerifyResult {
 	start := time.Now()
 	r.gate.Lock()
 	defer r.gate.Unlock()
-	r.c.Drain()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
 	res := VerifyResult{At: start, ReplicasConsistent: true}
-	ref := r.c.Snapshot(0)
-	res.Records = len(ref)
-	for rep := 1; rep < r.reps; rep++ {
-		other := r.c.Snapshot(rep)
-		if !maps.EqualFunc(ref, other, bytesEqual) {
-			res.ReplicasConsistent = false
-			res.DivergentKeys = append(res.DivergentKeys, diffKeys(ref, other, rep, 5)...)
+	states, err := r.quiesceAndRead(ctx)
+	if err != nil {
+		res.ReplicasConsistent = false
+		res.InvariantErrors = append(res.InvariantErrors, "verification could not run: "+err.Error())
+	} else {
+		ref := states[0]
+		res.Records = len(ref)
+		for rep := 1; rep < len(states); rep++ {
+			if !maps.EqualFunc(ref, states[rep], bytesEqual) {
+				res.ReplicasConsistent = false
+				res.DivergentKeys = append(res.DivergentKeys, diffKeys(ref, states[rep], rep, 5)...)
+			}
 		}
-	}
-	for _, w := range []Workload{r.micro, r.bank} {
-		if err := w.Check(ref); err != nil {
-			res.InvariantErrors = append(res.InvariantErrors, err.Error())
+		for _, w := range []Workload{r.micro, r.bank} {
+			if err := w.Check(ref); err != nil {
+				res.InvariantErrors = append(res.InvariantErrors, err.Error())
+			}
 		}
 	}
 	pause := time.Since(start)
@@ -210,25 +226,45 @@ func (r *Runner) Verify() VerifyResult {
 	return res
 }
 
+// Baseline, yük başlamadan önce kümenin mevcut durumunu iş yükü
+// değişmezlerinin başlangıç noktası olarak kaydeder. Kümede başka bir yük
+// üreticisi çalışmıyor olmalıdır.
+func (r *Runner) Baseline(ctx context.Context) error {
+	r.gate.Lock()
+	defer r.gate.Unlock()
+	states, err := r.quiesceAndRead(ctx)
+	if err != nil {
+		return err
+	}
+	r.micro.Baseline(states[0])
+	r.bank.Baseline(states[0])
+	r.log.Info("invariant baseline recorded", "records", len(states[0]))
+	return nil
+}
+
+func (r *Runner) quiesceAndRead(ctx context.Context) ([]map[calvin.Key][]byte, error) {
+	if err := r.be.Quiesce(ctx); err != nil {
+		return nil, err
+	}
+	return r.be.ReplicaStates(ctx)
+}
+
 // Checkpoint yürütmeyi durdurmadan bir checkpoint alır ve tüm replikaların
 // aynı sanal tutarlılık noktasında aynı görüntüyü kaydettiğini doğrular.
-func (r *Runner) Checkpoint(ctx context.Context, partitions int) (uint64, bool, error) {
-	// Doğrulayıcı Drain() içindeyken yeni işlem eklenmemesi için kapıdan geç.
+func (r *Runner) Checkpoint(ctx context.Context) (uint64, bool, error) {
+	// Doğrulayıcı Quiesce içindeyken yeni işlem eklenmemesi için kapıdan geç.
 	r.gate.RLock()
 	defer r.gate.RUnlock()
-	seq, err := r.c.Checkpoint(ctx)
+	seq, err := r.be.Checkpoint(ctx)
 	if err != nil {
 		return seq, false, err
 	}
-	snaps := make([]map[calvin.Key][]byte, r.reps)
-	for rep := range snaps {
-		snaps[rep] = map[calvin.Key][]byte{}
-		for p := 0; p < partitions; p++ {
-			maps.Copy(snaps[rep], r.c.CheckpointData(rep, p))
-		}
+	snaps, err := r.be.CheckpointStates(ctx)
+	if err != nil {
+		return seq, false, err
 	}
 	ok := true
-	for rep := 1; rep < r.reps; rep++ {
+	for rep := 1; rep < len(snaps); rep++ {
 		ok = ok && maps.EqualFunc(snaps[0], snaps[rep], bytesEqual)
 	}
 	r.m.CheckpointConsistent.Set(b2f(ok))
@@ -299,4 +335,9 @@ func diffKeys(a, b map[calvin.Key][]byte, rep, limit int) []string {
 		}
 	}
 	return out
+}
+
+// Totals başlangıçtan beri commit, abort, restart ve hata sayılarını döner.
+func (r *Runner) Totals() (committed, aborted, restarts, errs int64) {
+	return r.totals[0].Load(), r.totals[1].Load(), r.totals[2].Load(), r.totals[3].Load()
 }

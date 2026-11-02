@@ -63,12 +63,14 @@ type Txn struct {
 	kind      txnKind
 	parts     []int // okuma/yazma kümesindeki anahtarların partition'ları (sıralı)
 	submitted time.Time
+	origin    NodeID // isteği alan düğüm; sonuç buraya bildirilir
 }
 
 // batch, bir sequencer'ın bir epoch boyunca topladığı işlemlerdir.
 type batch struct {
 	epoch uint64
-	from  int // sequencer'ın partition id'si
+	from  int   // sequencer'ın partition id'si
+	cutAt int64 // liderin batch'i kestiği an (unix ns); gecikme ölçümü için
 	txns  []*Txn
 }
 

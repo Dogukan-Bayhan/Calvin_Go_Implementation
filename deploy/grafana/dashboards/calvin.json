@@ -589,7 +589,7 @@
     },
     {
       "type": "timeseries",
-      "title": "p99 gecikme: tek vs çok partition",
+      "title": "p99 gecikme: tek vs çok partition, istemci",
       "description": "",
       "id": 12,
       "datasource": {
@@ -631,7 +631,16 @@
           },
           "refId": "A",
           "expr": "histogram_quantile(0.99, sum by (le,multipartition) (rate(calvin_txn_latency_seconds_bucket[$__rate_interval])))",
-          "legendFormat": "mp={{multipartition}}"
+          "legendFormat": "düğüm mp={{multipartition}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le,workload) (rate(calvin_client_latency_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "istemci {{workload}} (ağ dahil)"
         }
       ]
     },
@@ -939,8 +948,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Replika gecikmesi (epoch)",
-      "description": "",
+      "title": "Replika gecikmesi",
+      "description": "Bir epoch'un liderde kesilmesinden replikanın en geride kalan scheduler'ında kilit istenmesine kadar geçen süre: replikasyon (Paxos) + ağ + kuyruk.",
       "id": 20,
       "datasource": {
         "type": "prometheus",
@@ -954,7 +963,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "s",
           "custom": {
             "lineWidth": 1,
             "fillOpacity": 10,
@@ -980,7 +989,7 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "max by (replica) (calvin_replica_lag_epochs)",
+          "expr": "max by (replica) (calvin_schedule_delay_seconds)",
           "legendFormat": "replica {{replica}}"
         }
       ]
@@ -1411,7 +1420,7 @@
             "uid": "loki"
           },
           "refId": "A",
-          "expr": "{job=\"calvin-lab\", level=~\"WARN|ERROR\"}"
+          "expr": "{job=~\"calvin.*\", level=~\"WARN|ERROR\"}"
         }
       ]
     },
@@ -1443,7 +1452,7 @@
             "uid": "loki"
           },
           "refId": "A",
-          "expr": "{job=\"calvin-lab\"} != \"txn completed\""
+          "expr": "{job=~\"calvin.*\"} != \"txn completed\""
         }
       ]
     }

@@ -11,10 +11,13 @@ scrape_configs:
           env: compose
 
   # Lab'ı host'ta `go run ./cmd/calvin-lab -log-file=deploy/logs/calvin.log`
-  # ile çalıştırırsanız (compose'daki calvin-lab servisini durdurup).
-  # Host'ta lab çalışmıyorken bu hedef "down" görünür; bu normaldir.
-  - job_name: calvin-lab-host
-    static_configs:
-      - targets: ["host.docker.internal:2112"]
-        labels:
-          env: host
+  # ile çalıştırmak için: compose'daki calvin-lab'ı durdurun
+  # (`docker compose stop calvin-lab`), aşağıdaki işi açın ve
+  # `curl -X POST localhost:9090/-/reload` çalıştırın. İkisini aynı anda açık
+  # bırakmayın: host.docker.internal:2112 compose lab'ının yayınlanan portuna
+  # da çıktığı için metrikler iki kez sayılır.
+  # - job_name: calvin-lab-host
+  #   static_configs:
+  #     - targets: ["host.docker.internal:2112"]
+  #       labels:
+  #         env: host

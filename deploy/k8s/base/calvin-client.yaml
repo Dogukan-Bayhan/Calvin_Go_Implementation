@@ -1,0 +1,75 @@
+# Yük üreticisi + canlı doğrulayıcı. Düğümlere RPC ile istek gönderir, periyodik
+# checkpoint alır ve yükü kısa süre durdurup replikaları karşılaştırır.
+# Aynı anda yalnızca bir istemci çalışmalıdır (doğrulama yükü durdurmayı ve
+# işlem sayımını varsayar); bench.ps1 bu yüzden bunu geçici olarak 0'a ölçekler.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: calvin-client
+  labels:
+    app: calvin-client
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: calvin-client
+  template:
+    metadata:
+      labels:
+        app: calvin-client
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: client
+          image: calvin:dev
+          imagePullPolicy: IfNotPresent
+          command: ["calvin-client"]
+          args:
+            - -replicas=$(REPLICAS)
+            - -partitions=$(PARTITIONS)
+            - -accounts=$(ACCOUNTS)
+            - -records=$(RECORDS)
+            - -customers=$(CUSTOMERS)
+            - -workload=$(WORKLOAD)
+            - -clients=$(CLIENTS)
+            - -mp=$(MP)
+            - -ci=$(CI)
+            - -peer-template=calvin-node-%d.calvin-node:7000
+            - -checkpoint-every=15s
+            - -verify-every=20s
+            - run
+          envFrom:
+            - configMapRef:
+                name: calvin-topology
+          ports:
+            - name: http
+              containerPort: 2113
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 500m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: calvin-client
+  labels:
+    app: calvin-client
+spec:
+  type: NodePort
+  selector:
+    app: calvin-client
+  ports:
+    - name: http
+      port: 2113
+      targetPort: http
+      nodePort: 30213

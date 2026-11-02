@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Tüm calvin-node pod'ları headless servisin DNS A kayıtlarından bulunur;
+  # düğüm sayısı değiştiğinde yapılandırma değişmez.
+  - job_name: calvin-node
+    dns_sd_configs:
+      - names: ["calvin-node.calvin.svc.cluster.local"]
+        type: A
+        port: 2112
+        refresh_interval: 10s
+
+  - job_name: calvin-client
+    static_configs:
+      - targets: ["calvin-client.calvin.svc.cluster.local:2113"]

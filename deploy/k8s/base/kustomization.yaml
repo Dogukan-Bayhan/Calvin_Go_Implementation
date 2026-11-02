@@ -1,0 +1,48 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: calvin
+
+resources:
+  - namespace.yaml
+  - calvin-node.yaml
+  - calvin-client.yaml
+  - observability/prometheus.yaml
+  - observability/loki.yaml
+  - observability/alloy.yaml
+  - observability/grafana.yaml
+
+# calvin-node StatefulSet'inin replika sayısı REPLICAS x PARTITIONS olmalıdır.
+# up.ps1 bunları bir overlay ile birlikte ayarlar.
+replicas:
+  - name: calvin-node
+    count: 12
+
+configMapGenerator:
+  # Düğümler ve istemci aynı topoloji ve iş yükü parametrelerini kullanmalıdır.
+  - name: calvin-topology
+    literals:
+      - REPLICAS=3
+      - PARTITIONS=4
+      - MODE=paxos
+      - ACCOUNTS=1000
+      - RECORDS=10000
+      - CUSTOMERS=100
+      - WORKLOAD=mixed
+      - CLIENTS=64
+      - MP=0.1
+      - CI=0.01
+  - name: prometheus-config
+    files:
+      - prometheus.yml=observability/prometheus.yml
+  - name: alloy-config
+    files:
+      - config.alloy=observability/config.alloy
+  - name: grafana-datasources
+    files:
+      - datasources.yml=observability/datasources.yml
+  - name: grafana-dashboard-provider
+    files:
+      - dashboards.yml=observability/dashboards.yml
+  - name: grafana-dashboards
+    files:
+      - calvin.json=observability/calvin-dashboard.json

@@ -98,7 +98,7 @@ func (l *paxosLeader) run(v *batch) {
 		}
 		l.mu.Unlock()
 		start := time.Now()
-		ok = l.quorum(func(a *acceptor) bool { return a.accept(bal, v.epoch, v) })
+		ok = l.quorum(func(p peer) bool { return p.accept(bal, v.epoch, v) })
 		c.cfg.Observer.PaxosRound(l.s.n.partition, time.Since(start), ok)
 		if ok {
 			l.learn(v)
@@ -124,8 +124,8 @@ func (l *paxosLeader) ensurePrepared() (ballot, bool) {
 	bal := l.b
 	var accMu sync.Mutex
 	best := make(map[uint64]acceptedVal)
-	ok := l.quorum(func(a *acceptor) bool {
-		promised, acc := a.prepare(bal)
+	ok := l.quorum(func(p peer) bool {
+		promised, acc := p.prepare(bal)
 		if promised {
 			accMu.Lock()
 			for slot, av := range acc {
@@ -153,23 +153,17 @@ func (l *paxosLeader) ensurePrepared() (ballot, bool) {
 	return bal, true
 }
 
-// quorum call'u gruptaki her acceptor'a (simüle edilmiş ağ üzerinden) uygular
-// ve çoğunluk olumlu yanıt verirse true döner.
-func (l *paxosLeader) quorum(call func(a *acceptor) bool) bool {
+// quorum call'u gruptaki her acceptor'a uygular ve çoğunluk olumlu yanıt
+// verirse true döner.
+func (l *paxosLeader) quorum(call func(p peer) bool) bool {
 	c := l.s.n.c
 	p := l.s.n.partition
 	n := c.cfg.Replicas
 	need := n/2 + 1
 	ch := make(chan bool, n)
 	for r := 0; r < n; r++ {
-		a := c.nodes[r][p].seq.acceptor
-		remote := r != l.s.n.replica
-		go func() {
-			c.delay(remote)
-			ok := call(a)
-			c.delay(remote)
-			ch <- ok
-		}()
+		pr := c.peer(l.s.n, NodeID{r, p})
+		go func() { ch <- call(pr) }()
 	}
 	yes, no := 0, 0
 	for i := 0; i < n; i++ {
@@ -196,10 +190,6 @@ func (l *paxosLeader) quorum(call func(a *acceptor) bool) bool {
 func (l *paxosLeader) learn(v *batch) {
 	c := l.s.n.c
 	for r := 0; r < c.cfg.Replicas; r++ {
-		dst := c.nodes[r][l.s.n.partition].seq
-		c.send(r != l.s.n.replica, func() {
-			dst.acceptor.learned(v.epoch)
-			dst.deliver(v)
-		})
+		c.peer(l.s.n, NodeID{r, l.s.n.partition}).learn(v)
 	}
 }

@@ -50,9 +50,14 @@ func kind(k calvin.Key) string {
 type Workload interface {
 	Name() string
 	Register(reg *calvin.Registry)
-	Load(c *calvin.Cluster)
-	Step(ctx context.Context, c *calvin.Cluster, rng *rand.Rand, s Settings) (calvin.Result, error)
+	Load(l Loader)
+	Step(ctx context.Context, ex Executor, rng *rand.Rand, s Settings) (calvin.Result, error)
 	Check(snap map[calvin.Key][]byte) error
+	// Baseline, yük başlamadan önceki durumu değişmezlerin başlangıç noktası
+	// olarak kaydeder. Dağıtık kümede istemci yeniden başlarsa küme verisi
+	// korunur; değişmezler bu yüzden "başlangıç + bu istemcinin etkisi"
+	// olarak kontrol edilir.
+	Baseline(snap map[calvin.Key][]byte)
 	SampleKey(rng *rand.Rand) calvin.Key
 }
 
@@ -64,7 +69,19 @@ type Micro struct {
 	Partitions int
 	Records    int
 	committed  atomic.Uint64
+	base       uint64
 }
+
+func (w *Micro) sum(snap map[calvin.Key][]byte) (sum uint64) {
+	for k, v := range snap {
+		if t := kind(k); t == "hot" || t == "rec" {
+			sum += u64(v)
+		}
+	}
+	return sum
+}
+
+func (w *Micro) Baseline(snap map[calvin.Key][]byte) { w.base = w.sum(snap) }
 
 func (w *Micro) Name() string { return "micro" }
 
@@ -85,9 +102,9 @@ func (w *Micro) Register(reg *calvin.Registry) {
 	})
 }
 
-func (w *Micro) Load(*calvin.Cluster) {} // sayaçlar 0 (yok) olarak başlar
+func (w *Micro) Load(Loader) {} // sayaçlar 0 (yok) olarak başlar
 
-func (w *Micro) Step(ctx context.Context, c *calvin.Cluster, rng *rand.Rand, s Settings) (calvin.Result, error) {
+func (w *Micro) Step(ctx context.Context, ex Executor, rng *rand.Rand, s Settings) (calvin.Result, error) {
 	hot := max(int(1/s.Contention+0.5), 1)
 	p := rng.Intn(w.Partitions)
 	parts := []int{p}
@@ -108,7 +125,7 @@ func (w *Micro) Step(ctx context.Context, c *calvin.Cluster, rng *rand.Rand, s S
 			keys = append(keys, k)
 		}
 	}
-	res, err := c.Exec(ctx, calvin.Request{Proc: "micro", ReadSet: keys, WriteSet: keys})
+	res, err := ex.Exec(ctx, calvin.Request{Proc: "micro", ReadSet: keys, WriteSet: keys})
 	if err == nil && res.Committed {
 		w.committed.Add(1)
 	}
@@ -116,13 +133,8 @@ func (w *Micro) Step(ctx context.Context, c *calvin.Cluster, rng *rand.Rand, s S
 }
 
 func (w *Micro) Check(snap map[calvin.Key][]byte) error {
-	var sum uint64
-	for k, v := range snap {
-		if t := kind(k); t == "hot" || t == "rec" {
-			sum += u64(v)
-		}
-	}
-	if want := 10 * w.committed.Load(); sum != want {
+	sum := w.sum(snap)
+	if want := w.base + 10*w.committed.Load(); sum != want {
 		return fmt.Errorf("micro: counter sum %d, want %d", sum, want)
 	}
 	return nil
@@ -155,6 +167,27 @@ type Bank struct {
 	CustomersPerPart int
 	InitialBalance   uint64
 	deposits         atomic.Uint64
+	baseDeposits     uint64
+}
+
+// Baseline, başlangıç bakiyelerinin üzerindeki fazlayı (önceki istemcilerin
+// deposit'leri) kaydeder.
+func (w *Bank) Baseline(snap map[calvin.Key][]byte) {
+	var sum uint64
+	for k, v := range snap {
+		if kind(k) == "acct" {
+			sum += u64(v)
+		}
+	}
+	w.baseDeposits = sum - uint64(w.Partitions*w.AccountsPerPart)*w.InitialBalance
+}
+
+// NewWorkloads lab'ın iki iş yükünü kurar. Dağıtık modda düğümler ve istemci
+// aynı parametrelerle çağırmalıdır: düğümler başlangıç verisini, istemci
+// değişmez kontrollerini bu parametrelerden türetir.
+func NewWorkloads(partitions, records, accounts, customers int) (*Micro, *Bank) {
+	return &Micro{Partitions: partitions, Records: records},
+		&Bank{Partitions: partitions, AccountsPerPart: accounts, CustomersPerPart: customers, InitialBalance: 1000}
 }
 
 type transferArgs struct {
@@ -203,24 +236,24 @@ func (w *Bank) Register(reg *calvin.Registry) {
 	})
 }
 
-func (w *Bank) Load(c *calvin.Cluster) {
+func (w *Bank) Load(l Loader) {
 	n := w.Partitions * w.AccountsPerPart
 	for i := 0; i < n; i++ {
-		c.Load(w.acct(i), enc(w.InitialBalance))
+		l.Load(w.acct(i), enc(w.InitialBalance))
 	}
 	rng := rand.New(rand.NewSource(42))
 	for j := 0; j < w.Partitions*w.CustomersPerPart; j++ {
-		c.Load(w.idx(j), []byte(w.acct(rng.Intn(n))))
+		l.Load(w.idx(j), []byte(w.acct(rng.Intn(n))))
 	}
 }
 
-func (w *Bank) Step(ctx context.Context, c *calvin.Cluster, rng *rand.Rand, s Settings) (calvin.Result, error) {
+func (w *Bank) Step(ctx context.Context, ex Executor, rng *rand.Rand, s Settings) (calvin.Result, error) {
 	nAcct := w.Partitions * w.AccountsPerPart
 	x := rng.Float64()
 	switch {
 	case x < s.OLLP:
 		cust := w.idx(rng.Intn(w.Partitions * w.CustomersPerPart))
-		res, err := c.ExecDependent(ctx, "deposit_by_name", []byte(cust), 20)
+		res, err := ex.ExecDependent(ctx, "deposit_by_name", []byte(cust), 20)
 		if err == nil && res.Committed {
 			w.deposits.Add(1)
 		}
@@ -228,7 +261,7 @@ func (w *Bank) Step(ctx context.Context, c *calvin.Cluster, rng *rand.Rand, s Se
 	case x < s.OLLP+s.Reindex:
 		cust := w.idx(rng.Intn(w.Partitions * w.CustomersPerPart))
 		target := w.acct(rng.Intn(nAcct))
-		return c.Exec(ctx, calvin.Request{Proc: "reindex", Args: []byte(target), WriteSet: []calvin.Key{cust}})
+		return ex.Exec(ctx, calvin.Request{Proc: "reindex", Args: []byte(target), WriteSet: []calvin.Key{cust}})
 	default:
 		from := rng.Intn(nAcct)
 		p := from % w.Partitions
@@ -244,7 +277,7 @@ func (w *Bank) Step(ctx context.Context, c *calvin.Cluster, rng *rand.Rand, s Se
 		amount := uint64(rng.Int63n(int64(w.InitialBalance)) + 1)
 		args, _ := json.Marshal(transferArgs{w.acct(from), w.acct(to), amount})
 		keys := []calvin.Key{w.acct(from), w.acct(to)}
-		return c.Exec(ctx, calvin.Request{Proc: "transfer", Args: args, ReadSet: keys, WriteSet: keys})
+		return ex.Exec(ctx, calvin.Request{Proc: "transfer", Args: args, ReadSet: keys, WriteSet: keys})
 	}
 }
 
@@ -261,7 +294,7 @@ func (w *Bank) Check(snap map[calvin.Key][]byte) error {
 	if accounts != n {
 		return fmt.Errorf("bank: %d accounts, want %d", accounts, n)
 	}
-	if want := uint64(n)*w.InitialBalance + w.deposits.Load(); sum != want {
+	if want := uint64(n)*w.InitialBalance + w.baseDeposits + w.deposits.Load(); sum != want {
 		return fmt.Errorf("bank: balance sum %d, want %d", sum, want)
 	}
 	for k, v := range snap {
