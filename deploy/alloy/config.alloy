@@ -1,0 +1,40 @@
+// calvin-lab'ın JSON log dosyasını takip eder ve Loki'ye gönderir.
+// Lab ister compose içinde ister host'ta çalışsın, logları ./deploy/logs
+// dizinine yazar; bu dizin buraya /logs olarak bağlanır.
+
+local.file_match "calvin" {
+  path_targets = [{"__path__" = "/logs/*.log", "job" = "calvin-lab"}]
+}
+
+loki.source.file "calvin" {
+  targets    = local.file_match.calvin.targets
+  forward_to = [loki.process.calvin.receiver]
+}
+
+loki.process "calvin" {
+  stage.json {
+    expressions = {
+      level = "level",
+      ts    = "time",
+    }
+  }
+
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339Nano"
+  }
+
+  stage.labels {
+    values = {
+      level = "",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

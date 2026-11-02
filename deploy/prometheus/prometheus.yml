@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # docker compose içinde çalışan lab
+  - job_name: calvin-lab
+    static_configs:
+      - targets: ["calvin-lab:2112"]
+        labels:
+          env: compose
+
+  # Lab'ı host'ta `go run ./cmd/calvin-lab -log-file=deploy/logs/calvin.log`
+  # ile çalıştırırsanız (compose'daki calvin-lab servisini durdurup).
+  # Host'ta lab çalışmıyorken bu hedef "down" görünür; bu normaldir.
+  - job_name: calvin-lab-host
+    static_configs:
+      - targets: ["host.docker.internal:2112"]
+        labels:
+          env: host

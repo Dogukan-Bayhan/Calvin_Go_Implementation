@@ -1,0 +1,5 @@
+deploy/logs
+deploy/checkpoints
+*.exe
+calvin.pdf
+.git

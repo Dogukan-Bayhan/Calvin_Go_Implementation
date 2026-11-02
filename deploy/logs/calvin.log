@@ -1,0 +1,11 @@
+{"time":"2026-11-02T07:51:57.84841088Z","level":"INFO","msg":"cluster started","service":"calvin-lab","replicas":3,"partitions":4,"replication":"paxos","epoch":"10ms","network_delay":"1ms","prefetch_delay":"0s"}
+{"time":"2026-11-02T07:51:57.849690021Z","level":"INFO","msg":"workload settings applied","service":"calvin-lab","workload":"mixed","clients":128,"multipartition":0.1,"contention":0.01,"ollp":0.1,"reindex":0.02,"think_ms":0}
+{"time":"2026-11-02T07:51:57.857501505Z","level":"INFO","msg":"http listening","service":"calvin-lab","addr":":2112"}
+{"time":"2026-11-02T07:51:57.862018071Z","level":"INFO","msg":"paxos leader prepared","service":"calvin-lab","partition":2,"ballot":1,"recovered_slots":0}
+{"time":"2026-11-02T07:51:57.862312442Z","level":"INFO","msg":"paxos leader prepared","service":"calvin-lab","partition":0,"ballot":1,"recovered_slots":0}
+{"time":"2026-11-02T07:51:57.862385707Z","level":"INFO","msg":"paxos leader prepared","service":"calvin-lab","partition":1,"ballot":1,"recovered_slots":0}
+{"time":"2026-11-02T07:51:57.862389019Z","level":"INFO","msg":"paxos leader prepared","service":"calvin-lab","partition":3,"ballot":1,"recovered_slots":0}
+{"time":"2026-11-02T07:52:02.869715059Z","level":"INFO","msg":"load summary","service":"calvin-lab","committed_per_s":9972,"aborted_per_s":1458,"restarts_per_s":0,"errors":0,"avg_latency":"11.19925ms","clients":128}
+{"time":"2026-11-02T07:52:07.86924954Z","level":"INFO","msg":"load summary","service":"calvin-lab","committed_per_s":9908,"aborted_per_s":1880,"restarts_per_s":0,"errors":0,"avg_latency":"10.847052ms","clients":128}
+{"time":"2026-11-02T07:52:12.869533254Z","level":"INFO","msg":"load summary","service":"calvin-lab","committed_per_s":10079,"aborted_per_s":1977,"restarts_per_s":0,"errors":0,"avg_latency":"10.623308ms","clients":128}
+{"time":"2026-11-02T07:52:12.92176321Z","level":"INFO","msg":"checkpoint completed","service":"calvin-lab","seq":6446748008472,"epoch":1501,"duration":"52.58573ms"}
