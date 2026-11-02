@@ -19,7 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"calvin"
+	calvin "github.com/Dogukan-Bayhan/Calvin_Go_Implementation"
 )
 
 func key(part int, kind string, i int) calvin.Key { return fmt.Sprintf("%d:%s-%d", part, kind, i) }

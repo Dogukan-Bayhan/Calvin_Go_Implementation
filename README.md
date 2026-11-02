@@ -1,6 +1,8 @@
 # Calvin (Go)
 
-Thomson ve ark., *Calvin: Fast Distributed Transactions for Partitioned Database Systems* (SIGMOD '12) makalesinin Go implementasyonu. İki şekilde çalışır:
+> **English summary.** An independent Go implementation of *Calvin: Fast Distributed Transactions for Partitioned Database Systems* (Thomson et al., SIGMOD 2012). It covers the sequencer with 10 ms epochs, async and Paxos-based input replication, the deterministic lock manager, the five-phase execution without two-phase commit, OLLP for dependent transactions, disk prefetching and Zig-Zag-style checkpointing. It runs either in a single process (simulated network) or as one process per node over real RPC, with a Kubernetes (kind) deployment, a load-generating client that continuously verifies replica consistency, and a Prometheus/Loki/Grafana stack. Code comments and the rest of this README are in Turkish. Licensed under MIT.
+
+Thomson ve ark., *Calvin: Fast Distributed Transactions for Partitioned Database Systems* (SIGMOD '12, [doi:10.1145/2213836.2213838](https://doi.org/10.1145/2213836.2213838)) makalesinin bağımsız bir Go implementasyonu. Makalenin yazarlarıyla veya Yale'in orijinal Calvin koduyla bir bağlantısı yoktur. İki şekilde çalışır:
 
 - **Tek süreç:** tüm düğümler aynı süreçte goroutine olarak çalışır; ağ gecikmesi simüle edilir. Testler ve `calvin-lab` bu modu kullanır.
 - **Dağıtık:** her düğüm ayrı bir süreç/pod'dur ve düğümler gerçek ağ üzerinden RPC ile konuşur (`calvin-node`). İstemci `calvin-client` (ve `client` paketi) düğümlere istek gönderir.
@@ -130,3 +132,7 @@ Ayrıca her checkpoint'in tüm replikalarda aynı olduğu kontrol edilir.
 - Paxos lideri sabittir (replica 0); lider değişimi yok.
 - Disk simülasyonu ve prefetch yalnızca tek süreç modunda var.
 - Aralık kilitleri ve phantom koruması yok (makalede de yok).
+
+## Lisans
+
+[MIT](LICENSE). Makalenin kendisi bu repoda yer almaz; telif hakkı ACM'ye aittir, yukarıdaki DOI bağlantısından erişilebilir.

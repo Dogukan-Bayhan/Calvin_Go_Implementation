@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"calvin"
+	calvin "github.com/Dogukan-Bayhan/Calvin_Go_Implementation"
 )
 
 // Partitioner "p:..." biçimindeki anahtarları p. partition'a yerleştirir;

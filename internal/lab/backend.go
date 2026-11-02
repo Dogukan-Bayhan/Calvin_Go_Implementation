@@ -4,8 +4,8 @@ import (
 	"context"
 	"maps"
 
-	"calvin"
-	"calvin/client"
+	calvin "github.com/Dogukan-Bayhan/Calvin_Go_Implementation"
+	"github.com/Dogukan-Bayhan/Calvin_Go_Implementation/client"
 )
 
 // Executor işlem çalıştırabilen her şeydir: tek süreçli *calvin.Cluster veya

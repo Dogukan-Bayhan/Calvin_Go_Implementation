@@ -27,10 +27,9 @@ import (
 	"syscall"
 	"time"
 
-	"calvin"
-	"calvin/client"
-	"calvin/internal/lab"
-
+	calvin "github.com/Dogukan-Bayhan/Calvin_Go_Implementation"
+	"github.com/Dogukan-Bayhan/Calvin_Go_Implementation/client"
+	"github.com/Dogukan-Bayhan/Calvin_Go_Implementation/internal/lab"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )

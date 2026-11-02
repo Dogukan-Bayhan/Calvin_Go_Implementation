@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"calvin"
+	calvin "github.com/Dogukan-Bayhan/Calvin_Go_Implementation"
 )
 
 // Client eşzamanlı kullanıma güvenlidir.

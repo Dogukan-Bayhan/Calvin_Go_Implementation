@@ -1,3 +1,6 @@
+# Makale PDF'i ACM telifli; repoda yayınlanmaz (README'deki bağlantıya bakın).
+*.pdf
+
 deploy/logs/
-*.exe
 deploy/k8s/overlay/
+*.exe

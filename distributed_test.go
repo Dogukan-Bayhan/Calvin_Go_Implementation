@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"calvin"
-	"calvin/client"
+	calvin "github.com/Dogukan-Bayhan/Calvin_Go_Implementation"
+	"github.com/Dogukan-Bayhan/Calvin_Go_Implementation/client"
 )
 
 func u64(b []byte) int64 {

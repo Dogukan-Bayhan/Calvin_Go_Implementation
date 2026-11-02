@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"calvin"
+	calvin "github.com/Dogukan-Bayhan/Calvin_Go_Implementation"
 )
 
 // Settings çalışma anında HTTP API ile değiştirilebilen yük ayarlarıdır.

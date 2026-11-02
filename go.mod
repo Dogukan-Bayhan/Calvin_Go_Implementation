@@ -1,4 +1,4 @@
-module calvin
+module github.com/Dogukan-Bayhan/Calvin_Go_Implementation
 
 go 1.24.5
 

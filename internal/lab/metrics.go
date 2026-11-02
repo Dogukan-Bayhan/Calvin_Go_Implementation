@@ -9,8 +9,7 @@ import (
 	"strconv"
 	"time"
 
-	"calvin"
-
+	calvin "github.com/Dogukan-Bayhan/Calvin_Go_Implementation"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
